@@ -41,6 +41,7 @@ FISHER_POINTS = {
 VERDICTS = ("PASS", "FAIL")
 
 
+
 def load_env_file(path: Path = Path(".env")) -> None:
     """Load the simple KEY=VALUE entries used by this homework."""
     if not path.is_file():
@@ -57,7 +58,7 @@ def load_env_file(path: Path = Path(".env")) -> None:
 
 # Choose any 3 of the 15 points, e.g. CHOSEN_POINTS = [1, 7, 15]. Your agent
 # gives a PASS or FAIL verdict on these 3 points only, with your own rule for each.
-CHOSEN_POINTS: list[int] = []  ### YOUR CODE HERE
+CHOSEN_POINTS: list[int] = [1,4,7]  ### YOUR CODE HERE
 
 
 def build_agent() -> Any:
@@ -72,7 +73,194 @@ def build_agent() -> Any:
     you will probably create one tool-calling agent per company there.
     """
     ### YOUR CODE HERE
-    return None
+    import os
+    from langchain_deepseek import ChatDeepSeek
+    llm = ChatDeepSeek(
+    model = MODEL_NAME,
+    api_key = os.getenv("DEEPSEEK_API_KEY"),
+    temperature=0,
+    )
+    return llm
+
+
+
+async def analyze_single_company(
+    agent: Any, 
+    name: str, 
+    tools: list[Any], 
+    semaphore: asyncio.Semaphore
+) -> dict[str, Any]:
+    """Analyze one company: tools gather facts, LLM reasons and decides all 3 verdicts."""
+    import json
+    from langchain_core.messages import SystemMessage, HumanMessage
+    list_docs_tool, read_doc_tool, sql_tool, interview_tool = tools
+    async with semaphore:
+        # ----------------------------------------------------------------------
+        # 1. TOOL CALL: Gather Point 1 Financial Evidence (Dynamic GROUP BY)
+        # ----------------------------------------------------------------------
+        sql_growth = """
+        WITH full_years AS (
+            SELECT 
+                substr(order_date, 1, 4) AS yr,
+                SUM(amount) AS rev
+            FROM orders
+            GROUP BY yr
+            HAVING COUNT(DISTINCT substr(order_date, 1, 7)) = 12
+        ),
+        calc AS (
+            SELECT 
+                yr,
+                rev,
+                LAG(rev, 2) OVER (ORDER BY yr) AS rev_2y_ago,
+                LAG(yr, 2) OVER (ORDER BY yr) AS yr_2y_ago
+            FROM full_years
+        )
+        SELECT 
+            c.industry AS [Industry],
+            m.revenue_growth_2y_pct || '%' AS [Market_Standard_Benchmark] ,
+            calc.yr_2y_ago AS start_year,
+            calc.yr AS latest_year,
+            ROUND(calc.rev / 1000.0, 1) || ' MUSD' AS [Period_End_Revenue],
+            ROUND(((calc.rev - calc.rev_2y_ago) * 100.0 / calc.rev_2y_ago), 1) || '%' AS [Company_Actual_2Y_Growth],
+            CASE 
+                WHEN ((calc.rev - calc.rev_2y_ago) * 100.0 / calc.rev_2y_ago) >= m.revenue_growth_2y_pct 
+                    THEN 'OUTPERFORM (+ ' || ROUND(((calc.rev - calc.rev_2y_ago) * 100.0 / calc.rev_2y_ago) - m.revenue_growth_2y_pct, 1) || '%)'
+                ELSE 'UNDERPERFORM (- ' || ROUND(m.revenue_growth_2y_pct - ((calc.rev - calc.rev_2y_ago) * 100.0 / calc.rev_2y_ago), 1) || '%)'
+            END AS [Company_vs_Market_Status]
+        FROM company c
+        JOIN industry_medians m ON c.industry = m.industry
+        JOIN calc ON calc.rev_2y_ago IS NOT NULL
+        ORDER BY calc.yr DESC
+        LIMIT 1;
+        """
+        growth_fact = sql_tool.invoke({"query": sql_growth})
+        sql_revenue = """
+        WITH quarterly_rev AS (
+            SELECT 
+                substr(order_date, 1, 4) || 'Q' || ((CAST(substr(order_date, 6, 2) AS INT) - 1) / 3 + 1) AS quarter,
+                SUM(amount) AS rev
+            FROM orders
+            GROUP BY quarter
+        ),
+        quarterly_growth AS (
+            SELECT 
+                quarter,
+                ROUND(rev / 1000.0, 1) AS rev_musd,
+                LAG(rev, 1) OVER (ORDER BY quarter ASC) AS prev_q_rev,
+                LAG(rev, 4) OVER (ORDER BY quarter ASC) AS prev_year_same_q_rev,
+                ROUND(((rev - LAG(rev, 1) OVER (ORDER BY quarter ASC)) * 100.0 / LAG(rev, 1) OVER (ORDER BY quarter ASC)), 1) AS qoq_growth_pct,
+                ROUND(((rev - LAG(rev, 4) OVER (ORDER BY quarter ASC)) * 100.0 / LAG(rev, 4) OVER (ORDER BY quarter ASC)), 1) AS yoy_same_q_growth_pct
+            FROM quarterly_rev
+        )
+        SELECT 
+            quarter AS [Quarter],
+            rev_musd || ' MUSD' AS [Revenue],
+            CASE 
+                WHEN qoq_growth_pct IS NULL THEN 'N/A (base)' 
+                WHEN qoq_growth_pct >= 0 THEN '+' || qoq_growth_pct || '%' 
+                ELSE qoq_growth_pct || '%' 
+            END AS [QoQ_Sequential_Growth],
+            CASE 
+                WHEN yoy_same_q_growth_pct IS NULL THEN 'N/A (base)' 
+                WHEN yoy_same_q_growth_pct >= 0 THEN '+' || yoy_same_q_growth_pct || '%' 
+                ELSE yoy_same_q_growth_pct || '%' 
+            END AS [YoY_Same_Quarter_Growth]
+        FROM quarterly_growth
+        ORDER BY quarter DESC;
+
+        """
+        revenue_history = sql_tool.invoke({"query": sql_revenue})
+
+        sql_product = """
+            SELECT 
+                substr(launch_date, 1, 4) || 'Q' || ((CAST(substr(launch_date, 6, 2) AS INT) - 1) / 3 + 1) AS [Launch_Quarter],
+                COUNT(*) AS [Number_of_Products_Launched],
+                GROUP_CONCAT(product, '; ') AS [Product_List]
+            FROM products
+            GROUP BY [Launch_Quarter]
+            ORDER BY [Launch_Quarter] DESC;
+        """
+        product_history = sql_tool.invoke({"query": sql_product})
+        # ----------------------------------------------------------------------
+        # 2. TOOL CALL: Scuttlebutt Field Interviews (Point 4 & Point 7)
+        # ----------------------------------------------------------------------
+        p4_quote = interview_tool.invoke({"role": "customer", "topic": "sales_team"})
+        p7_quote_current = interview_tool.invoke({"role": "current_employee", "topic": "working_conditions"})
+        p7_quote_former = interview_tool.invoke({"role": "former_employee", "topic": "working_conditions"})
+        # ----------------------------------------------------------------------
+        # 3. LLM EVALUATION: The AI reasons over all 3 points and decides verdicts
+        # ----------------------------------------------------------------------
+        prompt = f"""
+            You are an equity research analyst evaluating '{name}' using Philip Fisher's 15-point framework from 'Common Stocks and Uncommon Profits'.
+            Evaluate the company on Points 1, 4, and 7 based strictly on the factual evidence provided:
+            ### Evidence for Point 1 '{FISHER_POINTS[1]}' :
+            - Industry & Growth Comparison:
+            {growth_fact}
+            - Revenue Progression:
+            {revenue_history}
+            - Product Launch History:
+            {product_history}
+            - Evaluation Rule:
+            According to Philip Fisher, an outstanding company must possess products or services with sufficient addressable market potential to sustain a sizable, multi-year increase in sales, rather than relying on saturated lines or temporary one-off surges.
+            Weigh all three dimensions of evidence together:
+            1. Multi-Year Industry Benchmark:
+               - Compare the company's multi-year sales growth over completed cycles against its industry peer median. OUTPERFORM indicates above-average customer demand and market share gains; UNDERPERFORM indicates market saturation, lagging competitiveness, or slowing industry momentum.
+            2. Quarterly Revenue Trajectory:
+               - Examine recent quarterly performance (newest quarters first) for ongoing momentum, noting whether YoY same-quarter growth remains consistently positive or is decelerating.
+            3. Product Launch Cadence:
+               - Review the company's commercialized product lines to assess product vitality, noting whether fresh product launches in recent quarters are expanding total sales potential.
+            ### Point 1 Final Determination:
+                - Mark PASS if the company demonstrates strong multi-year market potential outperforming its industry peer standard, backed by positive quarterly momentum and active commercialized product lines.
+                - Mark FAIL if the company underperforms its industry peer benchmark, exhibits persistent sales stagnation, or lacks the product potential to sustain future expansion.
+            ### Evidence for Point 4 '{FISHER_POINTS[4]}':
+            - Customer Field Interview: "{p4_quote}"
+            - Evaluation Rule: PASS if the sales organization is consultative, technically competent, and proactive. FAIL if customers report lack of product knowledge, rapid rep turnover, or transactional price-sheet delivery.
+            ### Evidence for Point 7 (Outstanding labor and personnel relations):
+            - Current Employee Field Interview: "{p7_quote_current}"
+            - Former Employee Field Interview: "{p7_quote_former}"
+            - Evaluation Rule: PASS if labor relations are positive (fair pay, high retention, healthy morale). FAIL if labor relations are negative, such as chronic excessive overtime, high employee turnover, or labor unrest.
+            ### Instructions:
+            Determine the verdict (PASS or FAIL) for Point 1, Point 4, and Point 7.
+            Provide a concise 2-3 sentence executive summary explaining your rationale.
+            If data is missing, unavailable, '(no rows)', or interviewees cannot comment, mark that point FAIL. Never output null, N/A, or UNKNOWN.
+            Respond ONLY with a JSON object in this exact schema:
+            {{
+              "point_1_verdict": "PASS" or "FAIL",
+              "point_4_verdict": "PASS" or "FAIL",
+              "point_7_verdict": "PASS" or "FAIL",
+              "summary": "Executive summary here"
+            }}
+            """
+        # Retry loop for API resilience
+        last_error = ""
+        for attempt in range(3):
+            try:
+                response = await agent.ainvoke([
+                    SystemMessage(content="You are a rigorous financial analyst. Output valid JSON only, without markdown code fences."),
+                    HumanMessage(content=prompt)
+                ])
+                text = response.content.strip()
+                if text.startswith("```"):
+                    text = text.strip("`").removeprefix("json").strip()
+                parsed = json.loads(text)
+                p1_v = "PASS" if str(parsed.get("point_1_verdict", "")).strip().upper() == "PASS" else "FAIL"
+                p4_v = "PASS" if str(parsed.get("point_4_verdict", "")).strip().upper() == "PASS" else "FAIL"
+                p7_v = "PASS" if str(parsed.get("point_7_verdict", "")).strip().upper() == "PASS" else "FAIL"
+                summary = parsed.get("summary", "")
+                if p1_v in ("PASS", "FAIL") and p4_v in ("PASS", "FAIL") and p7_v in ("PASS", "FAIL"):
+                    return {
+                        "points": {1: p1_v, 4: p4_v, 7: p7_v},
+                        "summary": summary
+                    }
+            except Exception as e:
+                last_error = str(e)
+                await asyncio.sleep(1.0 * (attempt + 1))
+        # If all 3 API retries fail, return audit failure without crashing
+        return {
+            "points": {1: "FAIL", 4: "FAIL", 7: "FAIL"},
+            "summary": f"Analysis failed after 3 API retries for {name}. Error: {last_error}"
+        }
+
 
 
 async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict[str, dict[str, Any]]:
@@ -109,8 +297,14 @@ async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict
     You may analyse companies in parallel (e.g. ``asyncio.gather``).
     """
     ### YOUR CODE HERE
-    _ = agent
-    return {name: {"points": {}, "summary": ""} for name in companies}
+    semaphore = asyncio.Semaphore(5)
+    tasks = [
+        analyze_single_company(agent, name, tools, semaphore)
+        for name, tools in companies.items()
+    ]
+    results = await asyncio.gather(*tasks)
+    return {name: res for name, res in zip(companies.keys(), results)}
+
 
 
 # Everything below is provided runner/scoring code. No edits are needed.
